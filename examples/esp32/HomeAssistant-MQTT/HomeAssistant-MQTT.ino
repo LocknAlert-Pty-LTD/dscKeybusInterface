@@ -7,9 +7,11 @@
  *  Mosquitto MQTT broker: https://mosquitto.org
  *
  *  Usage:
- *    1. Set the WiFi SSID and password in the sketch.
- *    2. Set the security system access code to permit disarming through Home Assistant.
- *    3. Set the MQTT server address in the sketch.
+ *    1. (Recommended) Enable WiFiManager below to launch a setup portal for Wi-Fi + MQTT + panel settings.
+ *       - Connect to the "DSCKeybus-Setup" access point to configure Wi-Fi, MQTT, panel profile, and wiring pins.
+ *       - After saving, the device connects to your network and Home Assistant.
+ *    2. If WiFiManager is disabled, set Wi-Fi, MQTT, panel profile, and pin defaults in the sketch.
+ *    3. Set the security system access code to permit disarming through Home Assistant.
  *    4. Copy the example configuration to Home Assistant's configuration.yaml and customize.
  *    5. Upload the sketch.
  *    6. Restart Home Assistant.
@@ -207,14 +209,26 @@ entity: alarm_control_panel.security_partition_1
 #include <PubSubClient.h>
 #include <dscKeybusInterface.h>
 
+// Optional: WiFi + MQTT provisioning portal (install WiFiManager library by tzapu)
+#define USE_WIFI_MANAGER 1
+
 // Settings
+const char* accessCode = "";    // An access code is required to disarm/night arm and may be required to arm or enable command outputs based on panel configuration.
+const int   mqttPort = 1883;    // MQTT server port
+char panelProfile[16] = "power-series";
+
+#if USE_WIFI_MANAGER
+#include <WiFiManager.h>
+char mqttServer[41] = "homeassistant.local";   // MQTT server domain name or IP address
+char mqttUsername[33] = "";                    // Optional, leave blank if not required
+char mqttPassword[65] = "";                    // Optional, leave blank if not required
+#else
 const char* wifiSSID = "";
 const char* wifiPassword = "";
-const char* accessCode = "";    // An access code is required to disarm/night arm and may be required to arm or enable command outputs based on panel configuration.
 const char* mqttServer = "";    // MQTT server domain name or IP address
-const int   mqttPort = 1883;    // MQTT server port
 const char* mqttUsername = "";  // Optional, leave blank if not required
 const char* mqttPassword = "";  // Optional, leave blank if not required
+#endif
 
 // MQTT topics - match to Home Assistant's configuration.yaml
 const char* mqttClientName = "dscKeybusInterface";
@@ -228,23 +242,270 @@ const char* mqttStatusTopic = "dsc/Status";            // Sends online/offline s
 const char* mqttBirthMessage = "online";
 const char* mqttLwtMessage = "offline";
 const char* mqttSubscribeTopic = "dsc/Set";            // Receives messages to write to the panel
+const char* mqttDiscoveryPrefix = "homeassistant";     // Home Assistant MQTT discovery prefix
+const bool  mqttDiscoveryEnabled = true;
 
 // Configures the Keybus interface with the specified pins - dscWritePin is optional, leaving it out disables the
-// virtual keypad.
-#define dscClockPin 18  // 4,13,16-39
-#define dscReadPin  19  // 4,13,16-39
-#define dscPC16Pin  17  // DSC Classic Series only, 4,13,16-39
-#define dscWritePin 21  // 4,13,16-33
+// virtual keypad. Adjust these values for your specific ESP32 board/panel wiring.
+byte dscClockPin = 18;  // 4,13,16-39
+byte dscReadPin  = 19;  // 4,13,16-39
+byte dscPC16Pin  = 17;  // DSC Classic Series only, 4,13,16-39
+byte dscWritePin = 21;  // 4,13,16-33
 
 // Initialize components
 #ifndef dscClassicSeries
-dscKeybusInterface dsc(dscClockPin, dscReadPin, dscWritePin);
+dscKeybusInterface* dsc = nullptr;
 #else
-dscClassicInterface dsc(dscClockPin, dscReadPin, dscPC16Pin, dscWritePin, accessCode);
+dscClassicInterface* dsc = nullptr;
 #endif
 WiFiClient ipClient;
-PubSubClient mqtt(mqttServer, mqttPort, ipClient);
+PubSubClient mqtt(ipClient);
 unsigned long mqttPreviousTime;
+
+bool parsePinValue(const char* value, byte& pin) {
+  if (!value || value[0] == '\0') {
+    return false;
+  }
+  char* end = nullptr;
+  long parsed = strtol(value, &end, 10);
+  if (end == value || *end != '\0' || parsed < 0 || parsed > 39) {
+    return false;
+  }
+  pin = static_cast<byte>(parsed);
+  return true;
+}
+
+String deviceJson() {
+  String payload = "{";
+  payload += "\"identifiers\":[\"";
+  payload += mqttClientName;
+  payload += "\"],";
+  payload += "\"name\":\"DSC Keybus Interface\",";
+  payload += "\"manufacturer\":\"taligentx\",";
+  payload += "\"model\":\"dscKeybusInterface\"";
+  payload += "}";
+  return payload;
+}
+
+void publishDiscoveryAlarmPanel(byte partition) {
+  String objectId = "dsc_partition_";
+  objectId += String(partition + 1);
+  String topic = String(mqttDiscoveryPrefix) + "/alarm_control_panel/" + objectId + "/config";
+
+  String stateTopic = String(mqttPartitionTopic) + String(partition + 1);
+  String payload = "{";
+  payload += "\"name\":\"Security Partition ";
+  payload += String(partition + 1);
+  payload += "\",";
+  payload += "\"object_id\":\"";
+  payload += objectId;
+  payload += "\",";
+  payload += "\"unique_id\":\"";
+  payload += objectId;
+  payload += "\",";
+  payload += "\"state_topic\":\"";
+  payload += stateTopic;
+  payload += "\",";
+  payload += "\"availability_topic\":\"";
+  payload += mqttStatusTopic;
+  payload += "\",";
+  payload += "\"command_topic\":\"";
+  payload += mqttSubscribeTopic;
+  payload += "\",";
+  payload += "\"payload_disarm\":\"";
+  payload += String(partition + 1) + "D\",";
+  payload += "\"payload_arm_home\":\"";
+  payload += String(partition + 1) + "S\",";
+  payload += "\"payload_arm_away\":\"";
+  payload += String(partition + 1) + "A\",";
+  payload += "\"payload_arm_night\":\"";
+  payload += String(partition + 1) + "N\",";
+  payload += "\"device\":";
+  payload += deviceJson();
+  payload += "}";
+
+  mqtt.publish(topic.c_str(), payload.c_str(), true);
+}
+
+void publishDiscoveryPartitionMessage(byte partition) {
+  String objectId = "dsc_partition_message_";
+  objectId += String(partition + 1);
+  String topic = String(mqttDiscoveryPrefix) + "/sensor/" + objectId + "/config";
+
+  String stateTopic = String(mqttPartitionTopic) + String(partition + 1) + mqttPartitionMessageSuffix;
+  String payload = "{";
+  payload += "\"name\":\"Security Partition ";
+  payload += String(partition + 1);
+  payload += " Message\",";
+  payload += "\"object_id\":\"";
+  payload += objectId;
+  payload += "\",";
+  payload += "\"unique_id\":\"";
+  payload += objectId;
+  payload += "\",";
+  payload += "\"icon\":\"mdi:shield\",";
+  payload += "\"state_topic\":\"";
+  payload += stateTopic;
+  payload += "\",";
+  payload += "\"availability_topic\":\"";
+  payload += mqttStatusTopic;
+  payload += "\",";
+  payload += "\"device\":";
+  payload += deviceJson();
+  payload += "}";
+
+  mqtt.publish(topic.c_str(), payload.c_str(), true);
+}
+
+void publishDiscoveryTrouble() {
+  String objectId = "dsc_trouble";
+  String topic = String(mqttDiscoveryPrefix) + "/binary_sensor/" + objectId + "/config";
+
+  String payload = "{";
+  payload += "\"name\":\"Security Trouble\",";
+  payload += "\"object_id\":\"";
+  payload += objectId;
+  payload += "\",";
+  payload += "\"unique_id\":\"";
+  payload += objectId;
+  payload += "\",";
+  payload += "\"device_class\":\"problem\",";
+  payload += "\"state_topic\":\"";
+  payload += mqttTroubleTopic;
+  payload += "\",";
+  payload += "\"payload_on\":\"1\",";
+  payload += "\"payload_off\":\"0\",";
+  payload += "\"device\":";
+  payload += deviceJson();
+  payload += "}";
+
+  mqtt.publish(topic.c_str(), payload.c_str(), true);
+}
+
+void publishDiscoveryFire(byte partition) {
+  String objectId = "dsc_fire_";
+  objectId += String(partition + 1);
+  String topic = String(mqttDiscoveryPrefix) + "/binary_sensor/" + objectId + "/config";
+
+  String stateTopic = String(mqttFireTopic) + String(partition + 1);
+  String payload = "{";
+  payload += "\"name\":\"Smoke Alarm ";
+  payload += String(partition + 1);
+  payload += "\",";
+  payload += "\"object_id\":\"";
+  payload += objectId;
+  payload += "\",";
+  payload += "\"unique_id\":\"";
+  payload += objectId;
+  payload += "\",";
+  payload += "\"device_class\":\"smoke\",";
+  payload += "\"state_topic\":\"";
+  payload += stateTopic;
+  payload += "\",";
+  payload += "\"payload_on\":\"1\",";
+  payload += "\"payload_off\":\"0\",";
+  payload += "\"device\":";
+  payload += deviceJson();
+  payload += "}";
+
+  mqtt.publish(topic.c_str(), payload.c_str(), true);
+}
+
+void publishDiscoveryZone(byte zone) {
+  String objectId = "dsc_zone_";
+  objectId += String(zone + 1);
+  String topic = String(mqttDiscoveryPrefix) + "/binary_sensor/" + objectId + "/config";
+
+  String stateTopic = String(mqttZoneTopic) + String(zone + 1);
+  String payload = "{";
+  payload += "\"name\":\"Zone ";
+  payload += String(zone + 1);
+  payload += "\",";
+  payload += "\"object_id\":\"";
+  payload += objectId;
+  payload += "\",";
+  payload += "\"unique_id\":\"";
+  payload += objectId;
+  payload += "\",";
+  payload += "\"state_topic\":\"";
+  payload += stateTopic;
+  payload += "\",";
+  payload += "\"payload_on\":\"1\",";
+  payload += "\"payload_off\":\"0\",";
+  payload += "\"device\":";
+  payload += deviceJson();
+  payload += "}";
+
+  mqtt.publish(topic.c_str(), payload.c_str(), true);
+}
+
+void publishDiscoveryPgm(byte pgm) {
+  String objectId = "dsc_pgm_";
+  objectId += String(pgm + 1);
+  String topic = String(mqttDiscoveryPrefix) + "/binary_sensor/" + objectId + "/config";
+
+  String stateTopic = String(mqttPgmTopic) + String(pgm + 1);
+  String payload = "{";
+  payload += "\"name\":\"PGM ";
+  payload += String(pgm + 1);
+  payload += "\",";
+  payload += "\"object_id\":\"";
+  payload += objectId;
+  payload += "\",";
+  payload += "\"unique_id\":\"";
+  payload += objectId;
+  payload += "\",";
+  payload += "\"state_topic\":\"";
+  payload += stateTopic;
+  payload += "\",";
+  payload += "\"payload_on\":\"1\",";
+  payload += "\"payload_off\":\"0\",";
+  payload += "\"device\":";
+  payload += deviceJson();
+  payload += "}";
+
+  mqtt.publish(topic.c_str(), payload.c_str(), true);
+}
+
+void publishDiscovery() {
+  if (!mqttDiscoveryEnabled) {
+    return;
+  }
+  publishDiscoveryTrouble();
+  for (byte partition = 0; partition < dscPartitions; partition++) {
+    publishDiscoveryAlarmPanel(partition);
+    publishDiscoveryPartitionMessage(partition);
+    publishDiscoveryFire(partition);
+  }
+  for (byte zone = 0; zone < (dscZones * 8); zone++) {
+    publishDiscoveryZone(zone);
+  }
+  for (byte pgm = 0; pgm < 14; pgm++) {
+    publishDiscoveryPgm(pgm);
+  }
+}
+
+void applyPanelProfile(const char* profile) {
+  if (!profile || profile[0] == '\0') {
+    return;
+  }
+  if (strcmp(profile, "esp32-c6") == 0) {
+    dscClockPin = 4;
+    dscReadPin = 5;
+    dscPC16Pin = 6;
+    dscWritePin = 7;
+  } else if (strcmp(profile, "power-series") == 0) {
+    dscClockPin = 18;
+    dscReadPin = 19;
+    dscPC16Pin = 17;
+    dscWritePin = 21;
+  } else if (strcmp(profile, "classic-series") == 0) {
+    dscClockPin = 18;
+    dscReadPin = 19;
+    dscPC16Pin = 17;
+    dscWritePin = 21;
+  }
+}
 
 
 void setup() {
@@ -254,22 +515,100 @@ void setup() {
   Serial.println();
 
   Serial.print(F("WiFi...."));
+#if USE_WIFI_MANAGER
+  WiFiManager wifiManager;
+  WiFiManagerParameter mqttServerParam("mqttServer", "MQTT server", mqttServer, sizeof(mqttServer));
+  WiFiManagerParameter mqttUsernameParam("mqttUsername", "MQTT username", mqttUsername, sizeof(mqttUsername));
+  WiFiManagerParameter mqttPasswordParam("mqttPassword", "MQTT password", mqttPassword, sizeof(mqttPassword));
+  WiFiManagerParameter panelProfileParam("panelProfile", "Panel profile", panelProfile, sizeof(panelProfile), "list='panelProfileList'");
+  WiFiManagerParameter panelProfileOptions("<datalist id='panelProfileList'>"
+                                           "<option value='power-series'>"
+                                           "<option value='classic-series'>"
+                                           "<option value='esp32-c6'>"
+                                           "</datalist>");
+  char dscClockPinValue[4];
+  char dscReadPinValue[4];
+  char dscPC16PinValue[4];
+  char dscWritePinValue[4];
+  snprintf(dscClockPinValue, sizeof(dscClockPinValue), "%u", dscClockPin);
+  snprintf(dscReadPinValue, sizeof(dscReadPinValue), "%u", dscReadPin);
+  snprintf(dscPC16PinValue, sizeof(dscPC16PinValue), "%u", dscPC16Pin);
+  snprintf(dscWritePinValue, sizeof(dscWritePinValue), "%u", dscWritePin);
+  WiFiManagerParameter dscClockPinParam("dscClockPin", "DSC clock pin", dscClockPinValue, sizeof(dscClockPinValue));
+  WiFiManagerParameter dscReadPinParam("dscReadPin", "DSC read pin", dscReadPinValue, sizeof(dscReadPinValue));
+  WiFiManagerParameter dscPC16PinParam("dscPC16Pin", "DSC PC-16 pin (classic)", dscPC16PinValue, sizeof(dscPC16PinValue));
+  WiFiManagerParameter dscWritePinParam("dscWritePin", "DSC write pin", dscWritePinValue, sizeof(dscWritePinValue));
+
+  wifiManager.addParameter(&mqttServerParam);
+  wifiManager.addParameter(&mqttUsernameParam);
+  wifiManager.addParameter(&mqttPasswordParam);
+  wifiManager.addParameter(&panelProfileParam);
+  wifiManager.addParameter(&panelProfileOptions);
+  wifiManager.addParameter(&dscClockPinParam);
+  wifiManager.addParameter(&dscReadPinParam);
+  wifiManager.addParameter(&dscPC16PinParam);
+  wifiManager.addParameter(&dscWritePinParam);
+  wifiManager.setConfigPortalTimeout(180);
+
+  if (!wifiManager.autoConnect("DSCKeybus-Setup")) {
+    Serial.println(F("failed to connect, rebooting"));
+    delay(3000);
+    ESP.restart();
+  }
+
+  strncpy(mqttServer, mqttServerParam.getValue(), sizeof(mqttServer));
+  strncpy(mqttUsername, mqttUsernameParam.getValue(), sizeof(mqttUsername));
+  strncpy(mqttPassword, mqttPasswordParam.getValue(), sizeof(mqttPassword));
+  strncpy(panelProfile, panelProfileParam.getValue(), sizeof(panelProfile));
+  mqttServer[sizeof(mqttServer) - 1] = '\0';
+  mqttUsername[sizeof(mqttUsername) - 1] = '\0';
+  mqttPassword[sizeof(mqttPassword) - 1] = '\0';
+  panelProfile[sizeof(panelProfile) - 1] = '\0';
+#else
   WiFi.mode(WIFI_STA);
   WiFi.begin(wifiSSID, wifiPassword);
   while (WiFi.status() != WL_CONNECTED) {
     Serial.print(".");
     delay(500);
   }
+#endif
+  applyPanelProfile(panelProfile);
+#ifndef dscClassicSeries
+  if (strcmp(panelProfile, "classic-series") == 0) {
+    Serial.println(F("Classic series selected in UI, but sketch is compiled for Power series."));
+  }
+#endif
+#if USE_WIFI_MANAGER
+  if (!parsePinValue(dscClockPinParam.getValue(), dscClockPin)) {
+    Serial.println(F("Invalid clock pin; using profile default."));
+  }
+  if (!parsePinValue(dscReadPinParam.getValue(), dscReadPin)) {
+    Serial.println(F("Invalid read pin; using profile default."));
+  }
+  if (!parsePinValue(dscPC16PinParam.getValue(), dscPC16Pin)) {
+    Serial.println(F("Invalid PC-16 pin; using profile default."));
+  }
+  if (!parsePinValue(dscWritePinParam.getValue(), dscWritePin)) {
+    Serial.println(F("Invalid write pin; using profile default."));
+  }
+#endif
   Serial.print(F("connected: "));
   Serial.println(WiFi.localIP());
 
+#ifndef dscClassicSeries
+  dsc = new dscKeybusInterface(dscClockPin, dscReadPin, dscWritePin);
+#else
+  dsc = new dscClassicInterface(dscClockPin, dscReadPin, dscPC16Pin, dscWritePin, accessCode);
+#endif
+
+  mqtt.setServer(mqttServer, mqttPort);
   mqtt.setCallback(mqttCallback);
   if (mqttConnect()) mqttPreviousTime = millis();
   else mqttPreviousTime = 0;
 
   // Starts the Keybus interface and optionally specifies how to print data.
   // begin() sets Serial by default and can accept a different stream: begin(Serial1), etc.
-  dsc.begin();
+  dsc->begin();
   Serial.println(F("DSC Keybus Interface is online."));
 }
 
@@ -277,34 +616,34 @@ void setup() {
 void loop() {
   mqttHandle();
 
-  dsc.loop();
+  dsc->loop();
 
-  if (dsc.statusChanged) {      // Checks if the security system status has changed
-    dsc.statusChanged = false;  // Reset the status tracking flag
+  if (dsc->statusChanged) {      // Checks if the security system status has changed
+    dsc->statusChanged = false;  // Reset the status tracking flag
 
     // If the Keybus data buffer is exceeded, the sketch is too busy to process all Keybus commands.  Call
     // loop() more often, or increase dscBufferSize in the library: src/dscKeybus.h or src/dscClassic.h
-    if (dsc.bufferOverflow) {
+    if (dsc->bufferOverflow) {
       Serial.println(F("Keybus buffer overflow"));
-      dsc.bufferOverflow = false;
+      dsc->bufferOverflow = false;
     }
 
     // Checks if the interface is connected to the Keybus
-    if (dsc.keybusChanged) {
-      dsc.keybusChanged = false;  // Resets the Keybus data status flag
-      if (dsc.keybusConnected) mqtt.publish(mqttStatusTopic, mqttBirthMessage, true);
+    if (dsc->keybusChanged) {
+      dsc->keybusChanged = false;  // Resets the Keybus data status flag
+      if (dsc->keybusConnected) mqtt.publish(mqttStatusTopic, mqttBirthMessage, true);
       else mqtt.publish(mqttStatusTopic, mqttLwtMessage, true);
     }
 
     // Sends the access code when needed by the panel for arming or command outputs
-    if (dsc.accessCodePrompt) {
-      dsc.accessCodePrompt = false;
-      dsc.write(accessCode);
+    if (dsc->accessCodePrompt) {
+      dsc->accessCodePrompt = false;
+      dsc->write(accessCode);
     }
 
-    if (dsc.troubleChanged) {
-      dsc.troubleChanged = false;  // Resets the trouble status flag
-      if (dsc.trouble) mqtt.publish(mqttTroubleTopic, "1", true);
+    if (dsc->troubleChanged) {
+      dsc->troubleChanged = false;  // Resets the trouble status flag
+      if (dsc->trouble) mqtt.publish(mqttTroubleTopic, "1", true);
       else mqtt.publish(mqttTroubleTopic, "0", true);
     }
 
@@ -312,53 +651,53 @@ void loop() {
     for (byte partition = 0; partition < dscPartitions; partition++) {
 
       // Skips processing if the partition is disabled or in installer programming
-      if (dsc.disabled[partition]) continue;
+      if (dsc->disabled[partition]) continue;
 
       // Publishes the partition status message
       publishMessage(mqttPartitionTopic, partition);
 
       // Publishes armed/disarmed status
-      if (dsc.armedChanged[partition]) {
+      if (dsc->armedChanged[partition]) {
         char publishTopic[strlen(mqttPartitionTopic) + 2];
         appendPartition(mqttPartitionTopic, partition, publishTopic);  // Appends the mqttPartitionTopic with the partition number
 
-        if (dsc.armed[partition]) {
-          if (dsc.armedAway[partition] && dsc.noEntryDelay[partition]) mqtt.publish(publishTopic, "armed_night", true);
-          else if (dsc.armedAway[partition]) mqtt.publish(publishTopic, "armed_away", true);
-          else if (dsc.armedStay[partition] && dsc.noEntryDelay[partition]) mqtt.publish(publishTopic, "armed_night", true);
-          else if (dsc.armedStay[partition]) mqtt.publish(publishTopic, "armed_home", true);
+        if (dsc->armed[partition]) {
+          if (dsc->armedAway[partition] && dsc->noEntryDelay[partition]) mqtt.publish(publishTopic, "armed_night", true);
+          else if (dsc->armedAway[partition]) mqtt.publish(publishTopic, "armed_away", true);
+          else if (dsc->armedStay[partition] && dsc->noEntryDelay[partition]) mqtt.publish(publishTopic, "armed_night", true);
+          else if (dsc->armedStay[partition]) mqtt.publish(publishTopic, "armed_home", true);
         }
         else mqtt.publish(publishTopic, "disarmed", true);
       }
 
       // Publishes exit delay status
-      if (dsc.exitDelayChanged[partition]) {
-        dsc.exitDelayChanged[partition] = false;  // Resets the exit delay status flag
+      if (dsc->exitDelayChanged[partition]) {
+        dsc->exitDelayChanged[partition] = false;  // Resets the exit delay status flag
         char publishTopic[strlen(mqttPartitionTopic) + 2];
         appendPartition(mqttPartitionTopic, partition, publishTopic);  // Appends the mqttPartitionTopic with the partition number
 
-        if (dsc.exitDelay[partition]) mqtt.publish(publishTopic, "pending", true);  // Publish as a retained message
-        else if (!dsc.exitDelay[partition] && !dsc.armed[partition]) mqtt.publish(publishTopic, "disarmed", true);
+        if (dsc->exitDelay[partition]) mqtt.publish(publishTopic, "pending", true);  // Publish as a retained message
+        else if (!dsc->exitDelay[partition] && !dsc->armed[partition]) mqtt.publish(publishTopic, "disarmed", true);
       }
 
       // Publishes alarm status
-      if (dsc.alarmChanged[partition]) {
-        dsc.alarmChanged[partition] = false;  // Resets the partition alarm status flag
+      if (dsc->alarmChanged[partition]) {
+        dsc->alarmChanged[partition] = false;  // Resets the partition alarm status flag
         char publishTopic[strlen(mqttPartitionTopic) + 2];
         appendPartition(mqttPartitionTopic, partition, publishTopic);  // Appends the mqttPartitionTopic with the partition number
 
-        if (dsc.alarm[partition]) mqtt.publish(publishTopic, "triggered", true);  // Alarm tripped
-        else if (!dsc.armedChanged[partition]) mqtt.publish(publishTopic, "disarmed", true);
+        if (dsc->alarm[partition]) mqtt.publish(publishTopic, "triggered", true);  // Alarm tripped
+        else if (!dsc->armedChanged[partition]) mqtt.publish(publishTopic, "disarmed", true);
       }
-      if (dsc.armedChanged[partition]) dsc.armedChanged[partition] = false;  // Resets the partition armed status flag
+      if (dsc->armedChanged[partition]) dsc->armedChanged[partition] = false;  // Resets the partition armed status flag
 
       // Publishes fire alarm status
-      if (dsc.fireChanged[partition]) {
-        dsc.fireChanged[partition] = false;  // Resets the fire status flag
+      if (dsc->fireChanged[partition]) {
+        dsc->fireChanged[partition] = false;  // Resets the fire status flag
         char publishTopic[strlen(mqttFireTopic) + 2];
         appendPartition(mqttFireTopic, partition, publishTopic);  // Appends the mqttFireTopic with the partition number
 
-        if (dsc.fire[partition]) mqtt.publish(publishTopic, "1");  // Fire alarm tripped
+        if (dsc->fire[partition]) mqtt.publish(publishTopic, "1");  // Fire alarm tripped
         else mqtt.publish(publishTopic, "0");                      // Fire alarm restored
       }
     }
@@ -369,12 +708,12 @@ void loop() {
     //   openZones[1] and openZonesChanged[1]: Bit 0 = Zone 9 ... Bit 7 = Zone 16
     //   ...
     //   openZones[7] and openZonesChanged[7]: Bit 0 = Zone 57 ... Bit 7 = Zone 64
-    if (dsc.openZonesStatusChanged) {
-      dsc.openZonesStatusChanged = false;                           // Resets the open zones status flag
+    if (dsc->openZonesStatusChanged) {
+      dsc->openZonesStatusChanged = false;                           // Resets the open zones status flag
       for (byte zoneGroup = 0; zoneGroup < dscZones; zoneGroup++) {
         for (byte zoneBit = 0; zoneBit < 8; zoneBit++) {
-          if (bitRead(dsc.openZonesChanged[zoneGroup], zoneBit)) {  // Checks an individual open zone status flag
-            bitWrite(dsc.openZonesChanged[zoneGroup], zoneBit, 0);  // Resets the individual open zone status flag
+          if (bitRead(dsc->openZonesChanged[zoneGroup], zoneBit)) {  // Checks an individual open zone status flag
+            bitWrite(dsc->openZonesChanged[zoneGroup], zoneBit, 0);  // Resets the individual open zone status flag
 
             // Appends the mqttZoneTopic with the zone number
             char zonePublishTopic[strlen(mqttZoneTopic) + 3];
@@ -383,7 +722,7 @@ void loop() {
             itoa(zoneBit + 1 + (zoneGroup * 8), zone, 10);
             strcat(zonePublishTopic, zone);
 
-            if (bitRead(dsc.openZones[zoneGroup], zoneBit)) {
+            if (bitRead(dsc->openZones[zoneGroup], zoneBit)) {
               mqtt.publish(zonePublishTopic, "1", true);            // Zone open
             }
             else mqtt.publish(zonePublishTopic, "0", true);         // Zone closed
@@ -396,12 +735,12 @@ void loop() {
     // PGM status is stored in the pgmOutputs[] and pgmOutputsChanged[] arrays using 1 bit per PGM output:
     //   pgmOutputs[0] and pgmOutputsChanged[0]: Bit 0 = PGM 1 ... Bit 7 = PGM 8
     //   pgmOutputs[1] and pgmOutputsChanged[1]: Bit 0 = PGM 9 ... Bit 5 = PGM 14
-    if (dsc.pgmOutputsStatusChanged) {
-      dsc.pgmOutputsStatusChanged = false;  // Resets the PGM outputs status flag
+    if (dsc->pgmOutputsStatusChanged) {
+      dsc->pgmOutputsStatusChanged = false;  // Resets the PGM outputs status flag
       for (byte pgmGroup = 0; pgmGroup < 2; pgmGroup++) {
         for (byte pgmBit = 0; pgmBit < 8; pgmBit++) {
-          if (bitRead(dsc.pgmOutputsChanged[pgmGroup], pgmBit)) {  // Checks an individual PGM output status flag
-            bitWrite(dsc.pgmOutputsChanged[pgmGroup], pgmBit, 0);  // Resets the individual PGM output status flag
+          if (bitRead(dsc->pgmOutputsChanged[pgmGroup], pgmBit)) {  // Checks an individual PGM output status flag
+            bitWrite(dsc->pgmOutputsChanged[pgmGroup], pgmBit, 0);  // Resets the individual PGM output status flag
 
             // Appends the mqttPgmTopic with the PGM number
             char pgmPublishTopic[strlen(mqttPgmTopic) + 3];
@@ -410,7 +749,7 @@ void loop() {
             itoa(pgmBit + 1 + (pgmGroup * 8), pgm, 10);
             strcat(pgmPublishTopic, pgm);
 
-            if (bitRead(dsc.pgmOutputs[pgmGroup], pgmBit)) {
+            if (bitRead(dsc->pgmOutputs[pgmGroup], pgmBit)) {
               mqtt.publish(pgmPublishTopic, "1", true);           // PGM enabled
             }
             else mqtt.publish(pgmPublishTopic, "0", true);        // PGM disabled
@@ -442,38 +781,38 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
   // Panic alarm
   if (payload[payloadIndex] == 'P') {
-    dsc.write('p');
+    dsc->write('p');
   }
 
   // Resets status if attempting to change the armed mode while armed or not ready
-  if (payload[payloadIndex] != 'D' && !dsc.ready[partition]) {
-    dsc.armedChanged[partition] = true;
-    dsc.statusChanged = true;
+  if (payload[payloadIndex] != 'D' && !dsc->ready[partition]) {
+    dsc->armedChanged[partition] = true;
+    dsc->statusChanged = true;
     return;
   }
 
   // Arm stay
-  if (payload[payloadIndex] == 'S' && !dsc.armed[partition] && !dsc.exitDelay[partition]) {
-    dsc.writePartition = partition + 1;         // Sets writes to the partition number
-    dsc.write('s');                             // Virtual keypad arm stay
+  if (payload[payloadIndex] == 'S' && !dsc->armed[partition] && !dsc->exitDelay[partition]) {
+    dsc->writePartition = partition + 1;         // Sets writes to the partition number
+    dsc->write('s');                             // Virtual keypad arm stay
   }
 
   // Arm away
-  else if (payload[payloadIndex] == 'A' && !dsc.armed[partition] && !dsc.exitDelay[partition]) {
-    dsc.writePartition = partition + 1;         // Sets writes to the partition number
-    dsc.write('w');                             // Virtual keypad arm away
+  else if (payload[payloadIndex] == 'A' && !dsc->armed[partition] && !dsc->exitDelay[partition]) {
+    dsc->writePartition = partition + 1;         // Sets writes to the partition number
+    dsc->write('w');                             // Virtual keypad arm away
   }
 
   // Arm night
-  else if (payload[payloadIndex] == 'N' && !dsc.armed[partition] && !dsc.exitDelay[partition]) {
-    dsc.writePartition = partition + 1;         // Sets writes to the partition number
-    dsc.write('n');                             // Virtual keypad arm away
+  else if (payload[payloadIndex] == 'N' && !dsc->armed[partition] && !dsc->exitDelay[partition]) {
+    dsc->writePartition = partition + 1;         // Sets writes to the partition number
+    dsc->write('n');                             // Virtual keypad arm away
   }
 
   // Disarm
-  else if (payload[payloadIndex] == 'D' && (dsc.armed[partition] || dsc.exitDelay[partition] || dsc.alarm[partition])) {
-    dsc.writePartition = partition + 1;         // Sets writes to the partition number
-    dsc.write(accessCode);
+  else if (payload[payloadIndex] == 'D' && (dsc->armed[partition] || dsc->exitDelay[partition] || dsc->alarm[partition])) {
+    dsc->writePartition = partition + 1;         // Sets writes to the partition number
+    dsc->write(accessCode);
   }
 }
 
@@ -484,7 +823,7 @@ void mqttHandle() {
     if (mqttCurrentTime - mqttPreviousTime > 5000) {
       mqttPreviousTime = mqttCurrentTime;
       if (mqttConnect()) {
-        if (dsc.keybusConnected) mqtt.publish(mqttStatusTopic, mqttBirthMessage, true);
+        if (dsc->keybusConnected) mqtt.publish(mqttStatusTopic, mqttBirthMessage, true);
         Serial.println(F("MQTT disconnected, successfully reconnected."));
         mqttPreviousTime = 0;
       }
@@ -500,7 +839,8 @@ bool mqttConnect() {
   if (mqtt.connect(mqttClientName, mqttUsername, mqttPassword, mqttStatusTopic, 0, true, mqttLwtMessage)) {
     Serial.print(F("connected: "));
     Serial.println(mqttServer);
-    dsc.resetStatus();  // Resets the state of all status components as changed to get the current status
+    publishDiscovery();
+    dsc->resetStatus();  // Resets the state of all status components as changed to get the current status
   }
   else {
     Serial.print(F("connection error: "));
@@ -530,7 +870,7 @@ void publishMessage(const char* sourceTopic, byte partition) {
   strcat(publishTopic, mqttPartitionMessageSuffix);
 
   // Publishes the current partition message
-  switch (dsc.status[partition]) {
+  switch (dsc->status[partition]) {
     case 0x01: mqtt.publish(publishTopic, "Partition ready", true); break;
     case 0x02: mqtt.publish(publishTopic, "Stay zones open", true); break;
     case 0x03: mqtt.publish(publishTopic, "Zones open", true); break;
